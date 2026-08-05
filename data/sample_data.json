@@ -1,0 +1,4 @@
+[
+  {"lat": 37.77, "lon": -122.41, "address": "123 Main St", "meta": {"nested": true}},
+  {"lat": 37.79, "lon": null, "address": "456 Oak Ave"}
+]

@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# i2i-workflow — generated PM workspace (PRDs, plans, tickets), produced
+# by the i2i-workflow Claude Code plugin. Regenerable by anyone who installs
+# the plugin and runs it against this repo — not source, doesn't need to
+# be tracked in git.
+_i2i/
+
+# Local datasets — keep out of the repo except curated samples
+data/*
+!data/sample_data.csv
+!data/sample_data.json

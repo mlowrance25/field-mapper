@@ -1,0 +1,8 @@
+lat,lon,linestring,address
+37.77,-122.41,,123 Main St
+,-122.42,"LINESTRING(0 0, 1 1)",
+37.79,,,456 Oak Ave
+37.80,-122.44,"LINESTRING(1 1, 2 2)",789 Pine Rd
+,,,
+37.81,-122.45,,
+   ,-122.46,,321 Elm St
