@@ -6,6 +6,7 @@ import streamlit as st
 from utils.cardinality import analyze_cardinality
 from utils.completeness import analyze_completeness_batch
 from utils.coverage import evaluate_coverage, validate_expression
+from utils.findings import field_enrichment, init_report_findings, new_finding_id, now_iso
 
 st.set_page_config(page_title="Relationship Analysis — FieldMapper", layout="wide")
 st.title("Relationship Analysis")
@@ -20,6 +21,8 @@ stem = filename.rsplit(".", 1)[0]
 columns = df.columns.tolist()
 
 st.caption(f"Dataset: **{filename}** — {len(df):,} rows × {len(df.columns)} columns")
+
+init_report_findings()
 
 
 def _tokens_to_expr(tokens: list[str]) -> str:
@@ -37,8 +40,22 @@ def render_cardinality_results(df, stem):
     field_a = result["field_a"]
     field_b = result["field_b"]
 
-    # Primary display always follows the declared direction (or A→B by default)
-    if expectation and expectation["direction"] == "B→A":
+    # Which direction's fanout actually embodies the declared constraint.
+    # For "1-to-many" shapes the constraint is on the *reverse* side of the
+    # declared direction (e.g. A→B, 1-to-many means "A maps to many B" is
+    # expected — the constraint is that each B maps back to only one A).
+    # The summary banner and the alarm panel must always describe the same
+    # side; this single value drives both so they can't diverge the way
+    # they did before this fix (TICKET-004: summary showed raw declared-
+    # direction stats while a 1-to-many alarm silently checked the other
+    # direction, so the two numbers described different things).
+    display_direction = expectation["direction"] if expectation else "A→B"
+    if expectation and expectation["shape"] == "1-to-many":
+        display_direction = "B→A" if expectation["direction"] == "A→B" else "A→B"
+
+    # Primary display always follows display_direction (may differ from the
+    # declared direction — see above)
+    if display_direction == "B→A":
         primary_table = result["mapping_table_ba"]
         primary_key, primary_val = field_b, field_a
         conf = result["conformance_ba"]
@@ -59,43 +76,26 @@ def render_cardinality_results(df, stem):
         info_conf = result["conformance_ba"]
         info_key, info_val = field_b, field_a
 
-    # Resolve alarms based on direction + expected shape.
-    # The constraint side depends on shape — not every direction violation is an alarm.
-    # Example: for 1-to-many A→B, A having many B values is expected;
-    # the constraint is that B values should each map back to only one A.
+    # Resolve alarms from the SAME display_direction used above, so the
+    # alarm panel can never disagree with the summary banner again.
     alarm_set = set()
     alarm_key = alarm_val = alarm_finding = None
 
+    print(f"84.Expection: {expectation}")
     if expectation:
-        _dir = expectation["direction"]
         _shape = expectation["shape"]
-
+        print(f"87.Shape: {_shape}")
         if _shape == "many-to-many":
             pass  # no constraint — no alarms possible
-
-        elif _dir == "A→B":
-            if _shape in ("1-to-1", "many-to-1"):
-                # Constraint: each A maps to exactly one B
-                alarm_set = set(result["violations_ab"])
-                alarm_key, alarm_val = field_a, field_b
-                alarm_finding = f"`{field_a}` values that map to more than one `{field_b}`"
-            elif _shape == "1-to-many":
-                # A→many B is expected; constraint is B belongs to only one A
-                alarm_set = set(result["violations_ba"])
-                alarm_key, alarm_val = field_b, field_a
-                alarm_finding = f"`{field_b}` values that appear under more than one `{field_a}`"
-
+        elif display_direction == "A→B":
+            print(f"91.Display direction: {display_direction}")
+            alarm_set = set(result["violations_ab"])
+            alarm_key, alarm_val = field_a, field_b
+            alarm_finding = f"`{field_a}` values that map to more than one `{field_b}`"
         else:  # B→A
-            if _shape in ("1-to-1", "many-to-1"):
-                # Constraint: each B maps to exactly one A
-                alarm_set = set(result["violations_ba"])
-                alarm_key, alarm_val = field_b, field_a
-                alarm_finding = f"`{field_b}` values that map to more than one `{field_a}`"
-            elif _shape == "1-to-many":
-                # B→many A is expected; constraint is A belongs to only one B
-                alarm_set = set(result["violations_ab"])
-                alarm_key, alarm_val = field_a, field_b
-                alarm_finding = f"`{field_a}` values that appear under more than one `{field_b}`"
+            alarm_set = set(result["violations_ba"])
+            alarm_key, alarm_val = field_b, field_a
+            alarm_finding = f"`{field_b}` values that map to more than one `{field_a}`"
 
     shape = result["dominant_shape"] or "indeterminate"
 
@@ -161,6 +161,7 @@ def render_cardinality_results(df, stem):
             shape_sel = st.selectbox("Expected shape", SHAPE_OPTS, index=cur_shape_idx)
         apply = st.form_submit_button("Apply Expectation", type="primary")
 
+    print(f"167.Apply Expectation: {apply}")
     if apply:
         direction = "A→B" if direction_sel.startswith("A→B") else "B→A"
         st.session_state["_rel_expectation"] = {"direction": direction, "shape": shape_sel}
@@ -181,6 +182,53 @@ def render_cardinality_results(df, stem):
             .reset_index(drop=True)
         )
         st.dataframe(violating_rows, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------
+    # Add to Report
+    # -------------------------------------------------------------------
+    st.subheader("Add to Report")
+    cardinality_note = st.text_area(
+        "Add a note (optional)",
+        key="_cardinality_report_note",
+        placeholder="e.g. This mapping looks reliable enough to use as a join key.",
+    )
+    if st.button("Add to Report", key="_cardinality_add_to_report"):
+        enrichment = field_enrichment([field_a, field_b])
+        violations_full = []
+        if alarm_set:
+            violations_full = (
+                df[df[alarm_key].isin(alarm_set)][[alarm_key, alarm_val]]
+                .drop_duplicates()
+                .sort_values([alarm_key, alarm_val])
+                .to_dict("records")
+            )
+        finding = {
+            "finding_id": new_finding_id(),
+            "added_at": now_iso(),
+            "finding_type": "cardinality",
+            "dataset": filename,
+            "field_pair": [field_a, field_b],
+            "field_descriptions": enrichment["field_descriptions"],
+            "field_descriptions_status": enrichment["status"],
+            "llm_confidence": enrichment["llm_confidence"],
+            "expectation": expectation,
+            "display_direction": display_direction,
+            "metrics": {
+                "dominant_shape": shape,
+                "conf": conf, "viol_count": viol_count, "distinct_key": distinct_key,
+                "conformance_ab": result["conformance_ab"], "conformance_ba": result["conformance_ba"],
+                "violation_count_ab": result["violation_count_ab"], "violation_count_ba": result["violation_count_ba"],
+                "working_rows": result["working_rows"], "total_rows": result["total_rows"],
+                "distinct_a": result["distinct_a"], "distinct_b": result["distinct_b"],
+            },
+            "alarm_finding": alarm_finding,
+            "violations": violations_full,
+            "notes": cardinality_note,
+        }
+        st.session_state["_report_findings"].append(finding)
+        st.success(f"Added to report ({len(st.session_state['_report_findings'])} finding(s) total)")
 
     st.divider()
 
@@ -336,6 +384,34 @@ def render_completeness_comparison(stem):
     st.divider()
 
     # -------------------------------------------------------------------
+    # Add to Report
+    # -------------------------------------------------------------------
+    st.subheader("Add to Report")
+    completeness_cols = sorted({c for r in batch for c in r["columns"]})
+    completeness_note = st.text_area(
+        "Add a note (optional)",
+        key="_completeness_report_note",
+        placeholder="e.g. lat/lon alone leaves a large share of rows incomplete.",
+    )
+    if st.button("Add to Report", key="_completeness_add_to_report"):
+        enrichment = field_enrichment(completeness_cols)
+        finding = {
+            "finding_id": new_finding_id(),
+            "added_at": now_iso(),
+            "finding_type": "completeness",
+            "dataset": filename,
+            "field_descriptions": enrichment["field_descriptions"],
+            "field_descriptions_status": enrichment["status"],
+            "llm_confidence": enrichment["llm_confidence"],
+            "units": batch,
+            "notes": completeness_note,
+        }
+        st.session_state["_report_findings"].append(finding)
+        st.success(f"Added to report ({len(st.session_state['_report_findings'])} finding(s) total)")
+
+    st.divider()
+
+    # -------------------------------------------------------------------
     # Export
     # -------------------------------------------------------------------
     csv_rows = []
@@ -391,6 +467,36 @@ def render_coverage_results(stem):
         for r in result
     ]
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------
+    # Add to Report
+    # -------------------------------------------------------------------
+    st.subheader("Add to Report")
+    coverage_units = st.session_state.get("_coverage_units_used", {})
+    coverage_cols = sorted({c for cols in coverage_units.values() for c in cols})
+    coverage_note = st.text_area(
+        "Add a note (optional)",
+        key="_coverage_report_note",
+        placeholder="e.g. Adding address as a fallback closes the remaining coverage gap — likely needs geocoding.",
+    )
+    if st.button("Add to Report", key="_coverage_add_to_report"):
+        enrichment = field_enrichment(coverage_cols)
+        finding = {
+            "finding_id": new_finding_id(),
+            "added_at": now_iso(),
+            "finding_type": "coverage",
+            "dataset": filename,
+            "field_descriptions": enrichment["field_descriptions"],
+            "field_descriptions_status": enrichment["status"],
+            "llm_confidence": enrichment["llm_confidence"],
+            "units": coverage_units,
+            "results": result,
+            "notes": coverage_note,
+        }
+        st.session_state["_report_findings"].append(finding)
+        st.success(f"Added to report ({len(st.session_state['_report_findings'])} finding(s) total)")
 
     st.divider()
 
@@ -465,6 +571,7 @@ if rel_type == "cardinality":
             field_b = st.selectbox("Field B", columns, index=idx_b)
         submitted = st.form_submit_button("Analyze Mapping", type="primary")
 
+    print(f"Submitted: {submitted}")
     if submitted:
         if field_a == field_b:
             st.error("Field A and Field B must be different fields.")
@@ -655,6 +762,7 @@ elif rel_type == "completeness":
                 with st.spinner(f"Evaluating {len(declared_exprs)} expression(s)…"):
                     coverage_result = evaluate_coverage(df, available_units, declared_exprs)
                 st.session_state["_coverage_result"] = coverage_result
+                st.session_state["_coverage_units_used"] = available_units
             except ValueError as ve:
                 st.error(f"Could not evaluate expressions: {ve}")
                 st.stop()

@@ -4,6 +4,7 @@ import streamlit as st
 
 from utils.profiler import profile_dataframe
 from utils.claude_client import call_claude_tool
+from utils.output_classifier import classify_output
 
 DICT_BATCH_SIZE = 8
 from utils.prompt_builder import (
@@ -187,6 +188,7 @@ if st.session_state.get("_dict_pending"):
         for row in fields:
             row["inferred_type"] = type_by_field.get(row.get("field_name"), "")
 
+        st.session_state["dictionary_flags"] = classify_output(fields, profiles)
         st.session_state["dictionary_result"] = fields
         st.rerun()
 
@@ -201,6 +203,7 @@ if st.button("Generate Dictionary", type="primary"):
 
 if "dictionary_result" in st.session_state:
     result = st.session_state["dictionary_result"]
+    result_flags = st.session_state.get("dictionary_flags", {})
     result_df = pd.DataFrame(result)
 
     col1, col2 = st.columns(2)
@@ -233,9 +236,19 @@ if "dictionary_result" in st.session_state:
     }
 
     for row in result:
+        flag = result_flags.get(row.get("field_name", ""))
         col_name, col_type = st.columns([3, 1])
         with col_name:
-            st.markdown(f"**{row.get('field_name', '')}**")
+            if flag and flag.flagged:
+                # Deliberately generic — the uploader may be the source of
+                # the issue, so specifics stay server-side (see
+                # utils/output_classifier.py logger.warning).
+                st.markdown(
+                    f"**{row.get('field_name', '')}** ⚠️",
+                    help="Automated analysis has limited confidence in this field and it has been flagged for review.",
+                )
+            else:
+                st.markdown(f"**{row.get('field_name', '')}**")
         with col_type:
             st.caption(row.get("inferred_type", ""))
         st.write(row.get("description", ""))

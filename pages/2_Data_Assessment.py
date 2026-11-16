@@ -4,12 +4,14 @@ import streamlit as st
 
 from utils.profiler import profile_dataframe
 from utils.claude_client import call_claude_tool
+from utils.output_classifier import classify_output
 from utils.prompt_builder import (
     ASSESSMENT_SYSTEM,
     ASSESSMENT_TOOL,
     build_assessment_prompt,
     reconcile_fields,
 )
+from utils.findings import init_report_findings, new_finding_id, now_iso, single_field_enrichment
 
 ASSESS_BATCH_SIZE = 8
 
@@ -26,6 +28,8 @@ stem = filename.rsplit(".", 1)[0]
 dataset_context = st.session_state.get("dataset_context", "")
 
 st.caption(f"Dataset: **{filename}** — {len(df):,} rows × {len(df.columns)} columns")
+
+init_report_findings()
 
 # --- one-batch-per-rerun pipeline -------------------------------------------
 # Each st.rerun() call restarts the script cleanly, keeping each API call
@@ -57,6 +61,7 @@ if st.session_state.get("_assess_pending"):
         if extra:
             st.warning(f"Claude returned field(s) not in the dataset: {', '.join(extra)}.")
 
+        st.session_state["assessment_flags"] = classify_output(fields, profiles)
         st.session_state["assessment_result"] = fields
         st.session_state["assessment_profiles"] = {p["field_name"]: p for p in profiles}
         st.rerun()
@@ -72,6 +77,7 @@ if st.button("Run Assessment", type="primary"):
 if "assessment_result" in st.session_state:
     result = st.session_state["assessment_result"]
     profiles_map = st.session_state.get("assessment_profiles", {})
+    risk_flags = st.session_state.get("assessment_flags", {})
 
     # Join dictionary result if the Dictionary page has been run
     dict_map = {
@@ -137,6 +143,7 @@ if "assessment_result" in st.session_state:
         dict_entry = dict_map.get(fn, {})
         null_rate = profile.get("null_rate", 0.0)
         missing_pct = profile.get("missing_pct", 0.0)
+        field_risk = risk_flags.get(fn)
         rows.append({
             "field_name":       fn,
             "type":             profile.get("inferred_type", ""),
@@ -145,6 +152,10 @@ if "assessment_result" in st.session_state:
             "conf":             "—",
             "reliability":      make_reliability_label(null_rate, missing_pct),
             "flags":            make_flags(r, profile, dict_entry),
+            # Deliberately generic — the uploader may be the source of the
+            # issue, so specifics stay server-side (see
+            # utils/output_classifier.py logger.warning).
+            "risk_flags":       "🚩 review recommended" if field_risk and field_risk.flagged else "",
             "relationships":    make_relationships(r),
         })
     display_df = pd.DataFrame(rows)
@@ -201,6 +212,7 @@ if "assessment_result" in st.session_state:
             "conf":             st.column_config.TextColumn("Conf", width="small"),
             "reliability":      st.column_config.TextColumn("Reliability", width="medium"),
             "flags":            st.column_config.TextColumn("Flags", width="medium"),
+            "risk_flags":       st.column_config.TextColumn("Risk", width="medium"),
             "relationships":    st.column_config.TextColumn("Relationships", width="small"),
         },
     )
@@ -235,6 +247,33 @@ if "assessment_result" in st.session_state:
             st.dataframe(freq_df.head(10), use_container_width=True, hide_index=True)
             with st.expander(f"Show all {n_unique} values"):
                 st.dataframe(freq_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Add to Report")
+        dist_note = st.text_area(
+            "Add a note (optional)",
+            key="_dist_report_note",
+            placeholder="e.g. Low cardinality — may need a legend to interpret these codes.",
+        )
+        if st.button("Add to Report", key="_dist_add_to_report"):
+            enrichment = single_field_enrichment(dist_field)
+            finding = {
+                "finding_id": new_finding_id(),
+                "added_at": now_iso(),
+                "finding_type": "value_distribution",
+                "dataset": filename,
+                "field": dist_field,
+                "field_description": enrichment["field_description"],
+                "field_description_status": enrichment["field_description_status"],
+                "llm_confidence": enrichment["llm_confidence"],
+                "n_unique": n_unique,
+                "distribution": [
+                    {"value": v, "count": int(c), "pct": float(p)}
+                    for v, c, p in zip(freq_df["Value"], freq_df["Count"], freq_df["% of rows"])
+                ],
+                "notes": dist_note,
+            }
+            st.session_state["_report_findings"].append(finding)
+            st.success(f"Added to report ({len(st.session_state['_report_findings'])} finding(s) total)")
 
     st.divider()
 
